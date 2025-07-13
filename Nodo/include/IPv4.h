@@ -1,7 +1,7 @@
 #ifndef IPV4_H
 #define IPV4_H
 
-#include "tipos_de_datos.h"
+#include "Tipos_de_Datos.h"
 #include <cstdint>
 
 struct IPv4

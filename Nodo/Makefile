@@ -1,21 +1,32 @@
-# Makefile para Nodo
-CXX = g++
-CXXFLAGS = -Wall -std=c++98 -Iinclude
-LDFLAGS =
+CXX            ?= g++
+CXXFLAGS       := -Wall -Wextra -std=c++0x -Iinclude
+LDFLAGS        :=
+TARGET         := bin/app
 
-SRCDIR = src
-INCDIR = include
-BINDIR = bin
+SRCDIR         := src
+OBJDIR         := obj
+SOURCES        := $(wildcard $(SRCDIR)/*.cpp)
+OBJECTS        := $(patsubst $(SRCDIR)/%.cpp,$(OBJDIR)/%.o,$(SOURCES))
 
-SOURCES = $(wildcard $(SRCDIR)/*.cpp)
-OBJECTS = $(SOURCES:.cpp=.o)
-TARGET = $(BINDIR)/nodo
+.PHONY: all run clean
 
 all: $(TARGET)
 
-$(TARGET): $(SOURCES)
-	mkdir -p $(BINDIR)
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+$(TARGET): | bin $(OBJECTS)
+	$(CXX) $(OBJECTS) $(LDFLAGS) -o $@
+
+$(OBJDIR)/%.o: $(SRCDIR)/%.cpp | obj
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+bin:
+	mkdir -p $@
+
+obj:
+	mkdir -p $@
+
+run: $(TARGET)
+	@echo "== Ejecutando $(TARGET) =="
+	@./$(TARGET)
 
 clean:
-	rm -rf $(BINDIR) *.o
+	$(RM) -r $(OBJDIR) $(TARGET)

@@ -17,5 +17,6 @@ typedef uint8_t BYTE;
 typedef std::vector<BYTE> ByteVector;
 typedef std::vector<std::string> StringVector;
 typedef std::vector<int> IntVector;
+typedef time_t Tiempo;
 
 #endif // TIPOS_DE_DATOS_H

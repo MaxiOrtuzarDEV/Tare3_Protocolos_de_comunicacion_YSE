@@ -60,22 +60,27 @@ bool ComunicacionUART::estaAbierto() const
     return abierto_;
 }
 
-int ComunicacionUART::enviar(const std::string &mensaje)
+int ComunicacionUART::enviar(const std::vector<uint8_t> &mensaje)
 {
     if (!abierto_)
         return -1;
-    return write(descriptor_, mensaje.c_str(), mensaje.size());
+    return write(descriptor_, &mensaje[0], mensaje.size());
 }
 
-std::string ComunicacionUART::recibir(int maxLongitud)
+std::vector<uint8_t> ComunicacionUART::recibir()
 {
-    if (!abierto_)
-        return "";
+    std::vector<uint8_t> resultado;
 
-    char buffer[256];
-    memset(buffer, 0, sizeof(buffer));
-    int n = read(descriptor_, buffer, maxLongitud > 256 ? 256 : maxLongitud);
+    if (!abierto_)
+        return resultado;
+
+    uint8_t buffer[256];
+    int n = read(descriptor_, buffer, sizeof(buffer));
+
     if (n > 0)
-        return std::string(buffer, n);
-    return "";
+    {
+        resultado.assign(buffer, buffer + n);
+    }
+
+    return resultado;
 }

@@ -1,19 +1,13 @@
 #include "include/Slip.h"
 
-#include "SLIP.h"
-
-#define SLIP_END 0xC0
-#define SLIP_ESC 0xDB
-#define SLIP_ESC_END 0xDC
-#define SLIP_ESC_ESC 0xDD
-
 bool SLIP_encode(const ByteVector &entrada, ByteVector &salida)
 {
     salida.clear();
     salida.push_back(SLIP_END);
 
-    for (BYTE b : entrada)
+    for (ByteVector::const_iterator it = entrada.begin(); it != entrada.end(); ++it)
     {
+        BYTE b = *it;
         if (b == SLIP_END)
         {
             salida.push_back(SLIP_ESC);
@@ -45,7 +39,7 @@ bool SLIP_decode(const ByteVector &entrada, ByteVector &salida)
 
         if (b == SLIP_END)
         {
-            if (dentro && !siguiente_es_fin(entrada, i))
+            if (dentro && !salida.empty())
                 return true;
             dentro = true;
             continue;
@@ -73,16 +67,4 @@ bool SLIP_decode(const ByteVector &entrada, ByteVector &salida)
     }
 
     return !salida.empty();
-}
-
-bool siguiente_es_fin(const ByteVector &entrada, size_t desde)
-{
-    for (size_t j = desde + 1; j < entrada.size(); ++j)
-    {
-        if (entrada[j] == SLIP_END)
-            return true;
-        if (entrada[j] != 0x00)
-            return false;
-    }
-    return false;
 }
