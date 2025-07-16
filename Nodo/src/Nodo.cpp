@@ -1,14 +1,19 @@
-#include "include/Nodo.h"
-#include "include/ComunicacionUART.h"
-#include "include/Slip.h"
-#include "include/IPv4.h"
-#include "include/PropioProtocolo.h"
+#include "Nodo.h"
+#include "ComunicacionUART.h"
+#include "Slip.h"
+#include "IPv4.h"
+#include "PropioProtocolo.h"
 #include <iostream>
 #include <map>
 #include <cstdlib>
 #include <ctime>
 #include <sstream>
 #include <unistd.h>
+
+#include <termios.h>
+#include <fcntl.h>
+#include <sys/select.h>
+#include <sys/time.h>
 
 Nodo::Nodo(uint16_t ip) : uart("/dev/ttyUSB0", 115200), ip_nodo(ip), contador_id(1)
 {
@@ -35,7 +40,7 @@ void Nodo::limpiarPantalla()
 
 void Nodo::actualizarMensajesEntrantes()
 {
-    std::vector<uint8_t> datos_recibidos = uart.recibir();
+    ByteVector datos_recibidos = uart.recibir();
 
     if (datos_recibidos.empty())
         return;
@@ -88,6 +93,8 @@ void Nodo::actualizarMensajesEntrantes()
         std::cout << "[!] Protocolo desconocido: " << (int)paquete.protocolo << std::endl;
         break;
     }
+
+    verificarACKsPendientes();
 }
 
 void Nodo::procesarACK(const IPv4 &paquete)
@@ -225,35 +232,6 @@ void Nodo::enviarComandoAlModem(const PropioProtocolo &comando)
     enviarPaquete(paquete);
 }
 
-bool Nodo::esperarACK(uint16_t ip_destino, uint16_t id_mensaje, int max_intentos)
-{
-    for (int intento = 0; intento < max_intentos; intento++)
-    {
-        // Esperar por ACK durante 3 segundos
-        time_t inicio = time(NULL);
-        while (difftime(time(NULL), inicio) < 3.0)
-        {
-            actualizarMensajesEntrantes();
-
-            // Verificar si se recibió el ACK
-            if (acksEsperando.find(id_mensaje) == acksEsperando.end())
-            {
-                return true; // ACK recibido
-            }
-
-            usleep(100000); // 100ms
-        }
-
-        if (intento < max_intentos - 1)
-        {
-            std::cout << "[!] ACK no recibido, reintentando... (" << (intento + 1) << "/" << max_intentos << ")" << std::endl;
-        }
-    }
-
-    std::cout << "[!] ACK no recibido después de " << max_intentos << " intentos." << std::endl;
-    return false;
-}
-
 void Nodo::enviarPaquete(const IPv4 &paquete)
 {
     ByteVector ipv4_bytes = construirIPv4(paquete);
@@ -269,6 +247,43 @@ void Nodo::enviarPaquete(const IPv4 &paquete)
     if (bytes_enviados < 0)
     {
         std::cerr << "[!] Error al enviar por UART" << std::endl;
+    }
+}
+
+void Nodo::verificarACKsPendientes()
+{
+    time_t ahora = time(NULL);
+    std::vector<uint16_t> ids_a_eliminar;
+
+    for (std::map<uint16_t, ACKPendiente>::iterator it = acksEsperando.begin(); it != acksEsperando.end(); ++it)
+    {
+        ACKPendiente &ack = it->second;
+
+        if (difftime(ahora, ack.tiempo_envio) >= 3.0)
+        {
+            if (ack.intentos < 1)
+            {
+                std::cout << "[!] Reintentando envío de ID " << ack.id_mensaje << " a nodo 0x"
+                          << std::hex << ack.ip_destino << std::dec << std::endl;
+
+                // reenviar el paquete correspondiente (debes tener una copia de cada paquete si quieres reenviarlo)
+                // O puedes reconstruirlo si sabes qué tipo era.
+
+                ack.intentos++;
+                ack.tiempo_envio = ahora;
+            }
+            else
+            {
+                std::cout << "[!] No se recibió ACK para ID " << ack.id_mensaje
+                          << " después de 2 intentos. Descartando." << std::endl;
+                ids_a_eliminar.push_back(it->first);
+            }
+        }
+    }
+
+    for (size_t i = 0; i < ids_a_eliminar.size(); ++i)
+    {
+        acksEsperando.erase(ids_a_eliminar[i]);
     }
 }
 
@@ -330,13 +345,22 @@ void Nodo::enviarHello()
 
 void Nodo::enviarMensajeUnicast()
 {
-    uint16_t ip_destino;
-    std::string mensaje;
+    std::string buffer;
+    uint16_t ip_destino = 0;
 
     std::cout << "Ingrese IP destino (en hexadecimal, ej: 10 para 0x0010): ";
-    std::cin >> std::hex >> ip_destino >> std::dec;
+    std::cout.flush();
+    buffer.clear();
 
-    // Verificar que el nodo esté disponible
+    while (!leerLineaNoBloqueante(buffer))
+    {
+        actualizarMensajesEntrantes();
+        usleep(50000);
+    }
+
+    std::stringstream ss(buffer);
+    ss >> std::hex >> ip_destino;
+
     if (tablaNodosHello.find(ip_destino) == tablaNodosHello.end())
     {
         std::cout << "[!] Nodo 0x" << std::hex << ip_destino << std::dec
@@ -344,9 +368,17 @@ void Nodo::enviarMensajeUnicast()
         return;
     }
 
-    std::cin.ignore();
     std::cout << "Ingrese el mensaje: ";
-    std::getline(std::cin, mensaje);
+    std::cout.flush();
+    buffer.clear();
+
+    while (!leerLineaNoBloqueante(buffer))
+    {
+        actualizarMensajesEntrantes();
+        usleep(50000);
+    }
+
+    std::string mensaje = buffer;
 
     if (mensaje.empty())
     {
@@ -363,16 +395,14 @@ void Nodo::enviarMensajeUnicast()
     paquete.ip_origen = ip_nodo;
     paquete.ip_destino = ip_destino;
 
-    // Convertir mensaje a ByteVector
     for (size_t i = 0; i < mensaje.length(); i++)
     {
         paquete.datos.push_back(mensaje[i]);
     }
 
-    // Calcular checksum
     paquete.checksum = calcularChecksum(paquete);
 
-    // Agregar a ACKs esperando
+    // Agregar a ACKs esperando (el reintento lo maneja verificarACKsPendientes)
     ACKPendiente ack;
     ack.ip_destino = ip_destino;
     ack.id_mensaje = paquete.identificador;
@@ -381,26 +411,25 @@ void Nodo::enviarMensajeUnicast()
     acksEsperando[paquete.identificador] = ack;
 
     enviarPaquete(paquete);
-    std::cout << "[✓] Mensaje enviado a nodo 0x" << std::hex << ip_destino << std::dec << std::endl;
 
-    // Esperar ACK
-    if (esperarACK(ip_destino, paquete.identificador, 2))
-    {
-        std::cout << "[✓] ACK recibido correctamente." << std::endl;
-    }
-    else
-    {
-        std::cout << "[!] No se recibió ACK. Mensaje puede no haber llegado." << std::endl;
-    }
+    std::cout << "[✓] Mensaje enviado a nodo 0x" << std::hex << ip_destino << std::dec << std::endl;
+    std::cout << "[...] Esperando ACK en segundo plano...\n";
 }
 
 void Nodo::enviarMensajeBroadcast()
 {
-    std::string mensaje;
-
+    std::string buffer;
     std::cout << "Ingrese el mensaje broadcast: ";
-    std::cin.ignore();
-    std::getline(std::cin, mensaje);
+    std::cout.flush();
+    buffer.clear();
+
+    while (!leerLineaNoBloqueante(buffer))
+    {
+        actualizarMensajesEntrantes();
+        usleep(50000);
+    }
+
+    std::string mensaje = buffer;
 
     if (mensaje.empty())
     {
@@ -413,17 +442,15 @@ void Nodo::enviarMensajeBroadcast()
     paquete.offset_fragmento = 0;
     paquete.longitud_total = mensaje.length();
     paquete.identificador = obtenerNuevoID();
-    paquete.protocolo = 3; // Mensaje Broadcast
+    paquete.protocolo = 3; // Broadcast
     paquete.ip_origen = ip_nodo;
-    paquete.ip_destino = 0xFFFF; // Broadcast
+    paquete.ip_destino = 0xFFFF;
 
-    // Convertir mensaje a ByteVector
     for (size_t i = 0; i < mensaje.length(); i++)
     {
         paquete.datos.push_back(mensaje[i]);
     }
 
-    // Calcular checksum
     paquete.checksum = calcularChecksum(paquete);
 
     enviarPaquete(paquete);
@@ -432,15 +459,25 @@ void Nodo::enviarMensajeBroadcast()
 
 void Nodo::enviarComandoPrueba()
 {
+    std::string buffer;
     uint16_t ip_destino;
 
     std::cout << "Ingrese IP destino (en hexadecimal): ";
-    std::cin >> std::hex >> ip_destino >> std::dec;
+    std::cout.flush();
+    buffer.clear();
+
+    while (!leerLineaNoBloqueante(buffer))
+    {
+        actualizarMensajesEntrantes();
+        usleep(50000);
+    }
+
+    std::stringstream ss(buffer);
+    ss >> std::hex >> ip_destino;
 
     if (tablaNodosHello.find(ip_destino) == tablaNodosHello.end())
     {
-        std::cout << "[!] Nodo 0x" << std::hex << ip_destino << std::dec
-                  << " no está disponible." << std::endl;
+        std::cout << "[!] Nodo 0x" << std::hex << ip_destino << std::dec << " no está disponible." << std::endl;
         return;
     }
 
@@ -453,10 +490,8 @@ void Nodo::enviarComandoPrueba()
     paquete.ip_origen = ip_nodo;
     paquete.ip_destino = ip_destino;
 
-    // Calcular checksum
     paquete.checksum = calcularChecksum(paquete);
 
-    // Agregar a ACKs esperando
     ACKPendiente ack;
     ack.ip_destino = ip_destino;
     ack.id_mensaje = paquete.identificador;
@@ -465,26 +500,30 @@ void Nodo::enviarComandoPrueba()
     acksEsperando[paquete.identificador] = ack;
 
     enviarPaquete(paquete);
-    std::cout << "[✓] Comando de prueba enviado a nodo 0x" << std::hex << ip_destino << std::dec << std::endl;
-
-    // Esperar ACK
-    if (esperarACK(ip_destino, paquete.identificador, 2))
-    {
-        std::cout << "[✓] ACK recibido correctamente." << std::endl;
-    }
+    std::cout << "[✓] Comando de prueba enviado. Esperando ACK en segundo plano...\n";
 }
 
 void Nodo::enviarComandoLed()
 {
+    std::string buffer;
     uint16_t ip_destino;
 
     std::cout << "Ingrese IP destino (en hexadecimal): ";
-    std::cin >> std::hex >> ip_destino >> std::dec;
+    std::cout.flush();
+    buffer.clear();
+
+    while (!leerLineaNoBloqueante(buffer))
+    {
+        actualizarMensajesEntrantes();
+        usleep(50000);
+    }
+
+    std::stringstream ss(buffer);
+    ss >> std::hex >> ip_destino;
 
     if (tablaNodosHello.find(ip_destino) == tablaNodosHello.end())
     {
-        std::cout << "[!] Nodo 0x" << std::hex << ip_destino << std::dec
-                  << " no está disponible." << std::endl;
+        std::cout << "[!] Nodo 0x" << std::hex << ip_destino << std::dec << " no está disponible." << std::endl;
         return;
     }
 
@@ -493,14 +532,12 @@ void Nodo::enviarComandoLed()
     paquete.offset_fragmento = 0;
     paquete.longitud_total = 0;
     paquete.identificador = obtenerNuevoID();
-    paquete.protocolo = 6; // Estado LED
+    paquete.protocolo = 6; // LED
     paquete.ip_origen = ip_nodo;
     paquete.ip_destino = ip_destino;
 
-    // Calcular checksum
     paquete.checksum = calcularChecksum(paquete);
 
-    // Agregar a ACKs esperando
     ACKPendiente ack;
     ack.ip_destino = ip_destino;
     ack.id_mensaje = paquete.identificador;
@@ -509,33 +546,44 @@ void Nodo::enviarComandoLed()
     acksEsperando[paquete.identificador] = ack;
 
     enviarPaquete(paquete);
-    std::cout << "[✓] Comando LED enviado a nodo 0x" << std::hex << ip_destino << std::dec << std::endl;
-
-    // Esperar ACK
-    if (esperarACK(ip_destino, paquete.identificador, 2))
-    {
-        std::cout << "[✓] ACK recibido correctamente." << std::endl;
-    }
+    std::cout << "[✓] Comando LED enviado. Esperando ACK en segundo plano...\n";
 }
 
 void Nodo::enviarMensajeOLED()
 {
+    std::string buffer;
     uint16_t ip_destino;
-    std::string mensaje;
 
     std::cout << "Ingrese IP destino (en hexadecimal): ";
-    std::cin >> std::hex >> ip_destino >> std::dec;
+    std::cout.flush();
+    buffer.clear();
+
+    while (!leerLineaNoBloqueante(buffer))
+    {
+        actualizarMensajesEntrantes();
+        usleep(50000);
+    }
+
+    std::stringstream ss(buffer);
+    ss >> std::hex >> ip_destino;
 
     if (tablaNodosHello.find(ip_destino) == tablaNodosHello.end())
     {
-        std::cout << "[!] Nodo 0x" << std::hex << ip_destino << std::dec
-                  << " no está disponible." << std::endl;
+        std::cout << "[!] Nodo 0x" << std::hex << ip_destino << std::dec << " no está disponible." << std::endl;
         return;
     }
 
-    std::cin.ignore();
     std::cout << "Ingrese mensaje para OLED: ";
-    std::getline(std::cin, mensaje);
+    std::cout.flush();
+    buffer.clear();
+
+    while (!leerLineaNoBloqueante(buffer))
+    {
+        actualizarMensajesEntrantes();
+        usleep(50000);
+    }
+
+    std::string mensaje = buffer;
 
     if (mensaje.empty())
     {
@@ -548,20 +596,17 @@ void Nodo::enviarMensajeOLED()
     paquete.offset_fragmento = 0;
     paquete.longitud_total = mensaje.length();
     paquete.identificador = obtenerNuevoID();
-    paquete.protocolo = 7; // Mensaje OLED
+    paquete.protocolo = 7; // OLED
     paquete.ip_origen = ip_nodo;
     paquete.ip_destino = ip_destino;
 
-    // Convertir mensaje a ByteVector
     for (size_t i = 0; i < mensaje.length(); i++)
     {
         paquete.datos.push_back(mensaje[i]);
     }
 
-    // Calcular checksum
     paquete.checksum = calcularChecksum(paquete);
 
-    // Agregar a ACKs esperando
     ACKPendiente ack;
     ack.ip_destino = ip_destino;
     ack.id_mensaje = paquete.identificador;
@@ -570,28 +615,34 @@ void Nodo::enviarMensajeOLED()
     acksEsperando[paquete.identificador] = ack;
 
     enviarPaquete(paquete);
-    std::cout << "[✓] Mensaje OLED enviado a nodo 0x" << std::hex << ip_destino << std::dec << std::endl;
-
-    // Esperar ACK
-    if (esperarACK(ip_destino, paquete.identificador, 2))
-    {
-        std::cout << "[✓] ACK recibido correctamente." << std::endl;
-    }
+    std::cout << "[✓] Mensaje OLED enviado. Esperando ACK en segundo plano...\n";
 }
 
 void Nodo::menuComandosInternos()
 {
-    int opcion;
+    std::string buffer;
+    int opcion = -1;
 
     do
     {
+        actualizarMensajesEntrantes();
+
         std::cout << "\n========== COMANDOS INTERNOS ==========" << std::endl;
         std::cout << "1. Comando de prueba" << std::endl;
         std::cout << "2. Cambiar estado LED" << std::endl;
         std::cout << "3. Enviar mensaje a OLED" << std::endl;
         std::cout << "4. Volver al menú principal" << std::endl;
         std::cout << "Seleccione una opción: ";
-        std::cin >> opcion;
+        std::cout.flush();
+
+        buffer.clear();
+        while (!leerLineaNoBloqueante(buffer))
+        {
+            actualizarMensajesEntrantes();
+            usleep(50000);
+        }
+
+        opcion = atoi(buffer.c_str());
 
         switch (opcion)
         {
@@ -608,24 +659,37 @@ void Nodo::menuComandosInternos()
             std::cout << "Volviendo al menú principal..." << std::endl;
             break;
         default:
-            std::cout << "Opción no válida." << std::endl;
+            std::cout << "[!] Opción no válida." << std::endl;
             break;
         }
+
     } while (opcion != 4);
 }
 
 void Nodo::menuEnvioMensajes()
 {
-    int opcion;
+    std::string buffer;
+    int opcion = -1;
 
     do
     {
+        actualizarMensajesEntrantes();
+
         std::cout << "\n========== ENVÍO DE MENSAJES ==========" << std::endl;
         std::cout << "1. Enviar mensaje unicast" << std::endl;
         std::cout << "2. Enviar mensaje broadcast" << std::endl;
         std::cout << "3. Volver al menú principal" << std::endl;
         std::cout << "Seleccione una opción: ";
-        std::cin >> opcion;
+        std::cout.flush();
+
+        buffer.clear();
+        while (!leerLineaNoBloqueante(buffer))
+        {
+            actualizarMensajesEntrantes();
+            usleep(50000);
+        }
+
+        opcion = atoi(buffer.c_str());
 
         switch (opcion)
         {
@@ -639,33 +703,43 @@ void Nodo::menuEnvioMensajes()
             std::cout << "Volviendo al menú principal..." << std::endl;
             break;
         default:
-            std::cout << "Opción no válida." << std::endl;
+            std::cout << "[!] Opción no válida." << std::endl;
             break;
         }
+
     } while (opcion != 3);
 }
 
 void Nodo::menu()
 {
-    int opcion;
+    configurarEntradaNoBloqueante(); // Activar entrada no bloqueante
+    std::string buffer;
+    int opcion = -1;
 
-    // Inicializar generador de números aleatorios
     srand(time(NULL));
 
     do
     {
-        // Revisar mensajes entrantes
         actualizarMensajesEntrantes();
 
-        std::cout << "\n=============== MENÚ PRINCIPAL ===============" << std::endl;
-        std::cout << "IP del nodo: 0x" << std::hex << ip_nodo << std::dec << std::endl;
-        std::cout << "1. Ver nodos disponibles" << std::endl;
-        std::cout << "2. Enviar mensaje Hello" << std::endl;
-        std::cout << "3. Comandos internos del modem" << std::endl;
-        std::cout << "4. Enviar mensajes a otros nodos" << std::endl;
-        std::cout << "5. Salir" << std::endl;
+        std::cout << "\r=============== MENÚ PRINCIPAL ===============\n";
+        std::cout << "IP del nodo: 0x" << std::hex << ip_nodo << std::dec << "\n";
+        std::cout << "1. Ver nodos disponibles\n";
+        std::cout << "2. Enviar mensaje Hello\n";
+        std::cout << "3. Comandos internos del modem\n";
+        std::cout << "4. Enviar mensajes a otros nodos\n";
+        std::cout << "5. Salir\n";
         std::cout << "Seleccione una opción: ";
-        std::cin >> opcion;
+        std::cout.flush();
+
+        buffer.clear();
+        while (!leerLineaNoBloqueante(buffer))
+        {
+            actualizarMensajesEntrantes(); // sigue escuchando UART
+            usleep(50000);
+        }
+
+        opcion = atoi(buffer.c_str());
 
         switch (opcion)
         {
@@ -682,17 +756,52 @@ void Nodo::menu()
             menuEnvioMensajes();
             break;
         case 5:
-            std::cout << "Saliendo del programa..." << std::endl;
+            std::cout << "Saliendo...\n";
             break;
         default:
-            std::cout << "Opción no válida. Intente de nuevo." << std::endl;
+            std::cout << "[!] Opción inválida\n";
             break;
         }
 
-        // Pequeña pausa para evitar saturar la CPU
-        usleep(100000);
-
     } while (opcion != 5);
+
+    restaurarEntradaOriginal(); // Restaurar terminal
+}
+
+void Nodo::configurarEntradaNoBloqueante()
+{
+    struct termios tty;
+    tcgetattr(STDIN_FILENO, &tty);
+
+    tty.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &tty);
+
+    fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
+}
+
+void Nodo::restaurarEntradaOriginal()
+{
+    struct termios tty;
+    tcgetattr(STDIN_FILENO, &tty);
+    tty.c_lflag |= (ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &tty);
+
+    fcntl(STDIN_FILENO, F_SETFL, 0);
+}
+
+// Leer línea no bloqueante
+bool Nodo::leerLineaNoBloqueante(std::string &buffer)
+{
+    char c;
+    while (read(STDIN_FILENO, &c, 1) > 0)
+    {
+        if (c == '\n')
+        {
+            return true;
+        }
+        buffer += c;
+    }
+    return false;
 }
 
 void Nodo::run()

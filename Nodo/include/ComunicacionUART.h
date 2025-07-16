@@ -1,7 +1,7 @@
 #ifndef COMUNICACION_UART_H
 #define COMUNICACION_UART_H
 
-#include "include/Tipos_de_Datos.h"
+#include "Tipos_de_Datos.h"
 
 class ComunicacionUART
 {
@@ -13,8 +13,8 @@ public:
     void cerrar();
     bool estaAbierto() const;
 
-    int enviar(const std::vector<uint8_t> &mensaje);
-    std::vector<uint8_t> recibir();
+    int enviar(const ByteVector &mensaje);
+    ByteVector recibir();
 
 private:
     std::string dispositivo_;

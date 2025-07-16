@@ -35,7 +35,7 @@ private:
     void enviarPaquete(const IPv4 &paquete);
     void enviarACK(uint16_t ip_destino, uint16_t id_mensaje);
     void enviarComandoAlModem(const PropioProtocolo &comando);
-    bool esperarACK(uint16_t ip_destino, uint16_t id_mensaje, int max_intentos = 2);
+    void verificarACKsPendientes();
 
     // Métodos de procesamiento de mensajes
     void procesarACK(const IPv4 &paquete);
@@ -58,6 +58,11 @@ private:
     // Utilidades
     uint16_t obtenerNuevoID();
     void limpiarPantalla();
+
+    // Manejo de entrada No Bloqueante
+    void configurarEntradaNoBloqueante();
+    void restaurarEntradaOriginal();
+    bool leerLineaNoBloqueante(std::string &buffer);
 
 public:
     Nodo(uint16_t ip);

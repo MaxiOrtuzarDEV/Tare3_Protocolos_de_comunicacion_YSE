@@ -1,10 +1,10 @@
-#include "include/Nodo.h"
+#include "Nodo.h"
 #include <iostream>
 #include <cstdlib>
 
 int main(int argc, char *argv[])
 {
-    uint16_t ip_nodo = 0x0001; // IP por defecto
+    uint16_t ip_nodo = 0x0003; // IP
 
     // Permitir especificar IP como argumento
     if (argc > 1)

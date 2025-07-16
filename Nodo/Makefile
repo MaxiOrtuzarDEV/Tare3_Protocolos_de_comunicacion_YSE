@@ -12,7 +12,7 @@ OBJECTS        := $(patsubst $(SRCDIR)/%.cpp,$(OBJDIR)/%.o,$(SOURCES))
 
 all: $(TARGET)
 
-$(TARGET): | bin $(OBJECTS)
+$(TARGET): $(OBJECTS) | bin
 	$(CXX) $(OBJECTS) $(LDFLAGS) -o $@
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.cpp | obj

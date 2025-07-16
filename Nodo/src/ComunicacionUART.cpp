@@ -1,9 +1,10 @@
-#include "include/ComunicacionUART.h"
+#include "ComunicacionUART.h"
 #include <iostream>
 #include <fcntl.h>
 #include <termios.h>
 #include <unistd.h>
 #include <cstring>
+#include <errno.h>
 
 ComunicacionUART::ComunicacionUART(const std::string &dispositivo, int baudios)
     : dispositivo_(dispositivo), baudios_(baudios), descriptor_(-1), abierto_(false) {}
@@ -15,14 +16,12 @@ ComunicacionUART::~ComunicacionUART()
 
 bool ComunicacionUART::abrir()
 {
-    descriptor_ = open(dispositivo_.c_str(), O_RDWR | O_NOCTTY | O_NDELAY);
+    descriptor_ = open(dispositivo_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (descriptor_ < 0)
     {
         std::cerr << "Error al abrir el puerto " << dispositivo_ << std::endl;
         return false;
     }
-
-    fcntl(descriptor_, F_SETFL, 0); // modo bloqueante
 
     struct termios opciones;
     tcgetattr(descriptor_, &opciones);
@@ -60,16 +59,16 @@ bool ComunicacionUART::estaAbierto() const
     return abierto_;
 }
 
-int ComunicacionUART::enviar(const std::vector<uint8_t> &mensaje)
+int ComunicacionUART::enviar(const ByteVector &mensaje)
 {
     if (!abierto_)
         return -1;
     return write(descriptor_, &mensaje[0], mensaje.size());
 }
 
-std::vector<uint8_t> ComunicacionUART::recibir()
+ByteVector ComunicacionUART::recibir()
 {
-    std::vector<uint8_t> resultado;
+    ByteVector resultado;
 
     if (!abierto_)
         return resultado;
@@ -80,6 +79,10 @@ std::vector<uint8_t> ComunicacionUART::recibir()
     if (n > 0)
     {
         resultado.assign(buffer, buffer + n);
+    }
+    else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+    {
+        std::cerr << "Error de lectura UART" << std::endl;
     }
 
     return resultado;
