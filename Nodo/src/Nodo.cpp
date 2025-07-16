@@ -475,7 +475,7 @@ void Nodo::enviarComandoPrueba()
     std::stringstream ss(buffer);
     ss >> std::hex >> ip_destino;
 
-    if (tablaNodosHello.find(ip_destino) == tablaNodosHello.end())
+    if (tablaNodosHello.find(ip_destino) == tablaNodosHello.end() && ip_destino != ip_nodo)
     {
         std::cout << "[!] Nodo 0x" << std::hex << ip_destino << std::dec << " no está disponible." << std::endl;
         return;
@@ -521,7 +521,7 @@ void Nodo::enviarComandoLed()
     std::stringstream ss(buffer);
     ss >> std::hex >> ip_destino;
 
-    if (tablaNodosHello.find(ip_destino) == tablaNodosHello.end())
+    if (tablaNodosHello.find(ip_destino) == tablaNodosHello.end() && ip_destino != ip_nodo)
     {
         std::cout << "[!] Nodo 0x" << std::hex << ip_destino << std::dec << " no está disponible." << std::endl;
         return;
@@ -567,7 +567,7 @@ void Nodo::enviarMensajeOLED()
     std::stringstream ss(buffer);
     ss >> std::hex >> ip_destino;
 
-    if (tablaNodosHello.find(ip_destino) == tablaNodosHello.end())
+    if (tablaNodosHello.find(ip_destino) == tablaNodosHello.end() && ip_destino != ip_nodo)
     {
         std::cout << "[!] Nodo 0x" << std::hex << ip_destino << std::dec << " no está disponible." << std::endl;
         return;

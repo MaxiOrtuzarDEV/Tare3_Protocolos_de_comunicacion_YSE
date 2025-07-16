@@ -1,414 +1,438 @@
-#include <heltec.h>
+#include "red.h"
 #include <SPI.h>
-#include <LoRa.h>
-#include <vector>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 
-// Definiciones de tipos (similar a Tipos_de_Datos.h)
-typedef uint8_t BYTE;
-typedef std::vector<BYTE> ByteVector;
+// Configuración OLED
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET     16
+#define OLED_SDA        4
+#define OLED_SCL       15
 
-// Constantes SLIP (similar a Slip.h)
-#define SLIP_END 0xC0
-#define SLIP_ESC 0xDB
+// Configuración LoRa
+#define SF_LORA 7
+#define BW_LORA 250000L
+#define CRC_LORA 1
+#define TX_POWER_LORA 15
+
+// Configuración SLIP
+#define SLIP_END     0xC0
+#define SLIP_ESC     0xDB
 #define SLIP_ESC_END 0xDC
 #define SLIP_ESC_ESC 0xDD
 
-// Estructura IPv4 simplificado (similar a IPv4.h)
-struct IPv4 {
-    BYTE flag_fragmento;
-    uint16_t offset_fragmento;
-    BYTE longitud_total;
+// LED integrado
+#define LED_PIN 25
+
+// Tamaños de buffer
+#define BUFFER_SIZE 512
+#define MAX_PACKET_SIZE 255
+
+// Estructura IPv4 simplificada
+struct IPv4Packet {
+    uint8_t flag_fragmento : 2;
+    uint16_t offset_fragmento : 12;
+    uint8_t longitud_total;
+    uint8_t relleno;
     uint16_t identificador;
-    BYTE protocolo;
-    BYTE checksum;
+    uint8_t protocolo;
+    uint8_t checksum;
     uint16_t ip_origen;
     uint16_t ip_destino;
-    ByteVector datos;
+    uint8_t datos[MAX_PACKET_SIZE];
+    uint8_t datos_len;
 };
 
-// Estructura Protocolo Propio (similar a PropioProtocolo.h)
+// Estructura protocolo propio
 struct PropioProtocolo {
-    BYTE cmd;
-    BYTE longitud_de_dato;
-    BYTE dato[63];
-    BYTE fcs;
+    uint8_t cmd;
+    uint8_t longitud_de_dato;
+    uint8_t dato[63];
+    uint8_t fcs;
 };
 
-// Configuración LoRa
-#define BAND 915E6  // Frecuencia LoRa - ajustar según región
-#define SYNC_WORD 0x12  // Palabra de sincronización para la red
+// Variables globales
+Red red;
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// IP del modem (debe coincidir con la configurada en el Nodo)
-uint16_t ip_modem = 0x0001; // Cambiar según el kit asignado
+uint8_t buffer_uart[BUFFER_SIZE];
+uint8_t buffer_slip[BUFFER_SIZE];
+uint8_t buffer_lora[MAX_PACKET_SIZE];
+int uart_pos = 0;
+bool led_state = false;
+uint16_t mi_ip = 0x3; // IP por defecto, se puede cambiar según el kit
 
-// Buffer para UART
-String uartBuffer = "";
-bool slipPacketComplete = false;
+// Prototipos de funciones
+void procesarMensajeUART();
+void procesarMensajeLoRa();
+bool decodificarSLIP(uint8_t* entrada, int len_entrada, uint8_t* salida, int* len_salida);
+bool codificarSLIP(uint8_t* entrada, int len_entrada, uint8_t* salida, int* len_salida);
+bool parsearIPv4(uint8_t* datos, int len, IPv4Packet* paquete);
+void construirIPv4(IPv4Packet* paquete, uint8_t* buffer, int* len);
+uint8_t calcularChecksum(IPv4Packet* paquete);
+void procesarProtocoloPropio(PropioProtocolo* comando);
+void enviarPorUART(IPv4Packet* paquete);
+void enviarPorLoRa(IPv4Packet* paquete);
+void mostrarEnOLED(String mensaje);
+void mostrarImagenPrueba();
+uint8_t calcularFCS(PropioProtocolo* comando);
 
 void setup() {
-    // Inicializar pantalla OLED
-    Heltec.begin(true /*DisplayEnable Enable*/, false /*LoRa Disable*/, true /*Serial Enable*/);
-    
-    // Configurar UART
     Serial.begin(115200);
     
-    // Inicializar LoRa
-    LoRa.setPins(18, 14, 26); // CS, RST, IRQ
-    if (!LoRa.begin(BAND)) {
-        Serial.println("Error al iniciar LoRa!");
-        while (1);
+    // Inicializar LED
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, LOW);
+    
+    // Inicializar I2C para OLED
+    Wire.begin(OLED_SDA, OLED_SCL);
+    
+    // Inicializar OLED
+    if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        Serial.println("Error al inicializar OLED");
+    } else {
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setTextColor(SSD1306_WHITE);
+        display.setCursor(0,0);
+        display.println("Modem LoRa");
+        display.println("Iniciando...");
+        display.display();
     }
     
-    // Configurar parámetros LoRa
-    LoRa.setSyncWord(SYNC_WORD);
-    LoRa.setSpreadingFactor(7);
-    LoRa.setSignalBandwidth(125E3);
+    // Inicializar LoRa
+    red.begin(SF_LORA, BW_LORA, CRC_LORA, TX_POWER_LORA);
     
-    // Mostrar mensaje inicial
-    Heltec.display->clear();
-    Heltec.display->setTextAlignment(TEXT_ALIGN_LEFT);
-    Heltec.display->setFont(ArialMT_Plain_10);
-    Heltec.display->drawString(0, 0, "Modem LoRa V1");
-    Heltec.display->drawString(0, 12, "IP: 0x" + String(ip_modem, HEX));
-    Heltec.display->drawString(0, 24, "Esperando datos...");
-    Heltec.display->display();
+    // Configurar IP del nodo (se puede leer desde EEPROM o configurar)
+    mi_ip = 0x3;
+    
+    Serial.println("Modem LoRa inicializado");
+    Serial.print("IP del nodo: 0x");
+    Serial.println(mi_ip, HEX);
+    
+    mostrarEnOLED("Modem LoRa\nIP: 0x" + String(mi_ip, HEX) + "\nListo");
 }
 
 void loop() {
-    // Procesar datos recibidos por UART (desde Nodo)
-    procesarUART();
+    // Procesar mensajes no bloqueantes
+    procesarMensajeUART();
+    procesarMensajeLoRa();
     
-    // Procesar paquetes recibidos por LoRa
-    procesarLoRa();
+    // Pequeña pausa para evitar saturar el procesador
+    delay(1);
 }
 
-void procesarUART() {
-    while (Serial.available()) {
-        char c = Serial.read();
+void procesarMensajeUART() {
+    // Leer datos del puerto serial de forma no bloqueante
+    while (Serial.available() > 0 && uart_pos < BUFFER_SIZE - 1) {
+        uint8_t byte_recibido = Serial.read();
+        buffer_uart[uart_pos++] = byte_recibido;
         
-        // Detectar inicio/fin de paquete SLIP
-        if (c == SLIP_END) {
-            if (slipPacketComplete) {
-                // Paquete completo, procesarlo
-                ByteVector slipData;
-                for (size_t i = 0; i < uartBuffer.length(); i++) {
-                    slipData.push_back(uartBuffer[i]);
-                }
-                
-                ByteVector decoded;
-                if (SLIP_decode(slipData, decoded)) {
-                    IPv4 paquete;
-                    if (parsearIPv4(decoded, paquete)) {
-                        manejarPaqueteDesdeNodo(paquete);
+        // Si encontramos el final del frame SLIP
+        if (byte_recibido == SLIP_END && uart_pos > 1) {
+            // Decodificar SLIP
+            int len_decodificado;
+            if (decodificarSLIP(buffer_uart, uart_pos, buffer_slip, &len_decodificado)) {
+                // Parsear IPv4
+                IPv4Packet paquete;
+                if (parsearIPv4(buffer_slip, len_decodificado, &paquete)) {
+                    // Procesar según las reglas del protocolo
+                    if (paquete.ip_destino == mi_ip ) {
+                        
+                        PropioProtocolo comando;
+                        switch(paquete.protocolo)
+                        {
+                            case 5:
+                                comando.cmd = 5;
+                                procesarProtocoloPropio(&comando);
+                                break;
+                            
+                            case 6:
+                                comando.cmd = 6;
+                                procesarProtocoloPropio(&comando);
+                                break;
+                            case 7:
+                                comando.cmd = 7;
+                                procesarProtocoloPropio(&comando);
+                                break;
+                        }
+                        procesarProtocoloPropio(&comando);
+                        
+                    }
+                    else if (paquete.ip_destino != mi_ip || paquete.ip_destino == 0xFFFF) {
+                        // Reenviar por LoRa si no es protocolo propio
+                        if (paquete.protocolo != 0) {
+                            enviarPorLoRa(&paquete);
+                        }
                     }
                 }
-                
-                uartBuffer = "";
-                slipPacketComplete = false;
+            }
+            uart_pos = 0; // Reiniciar buffer
+        }
+    }
+    
+    // Reiniciar buffer si se llena
+    if (uart_pos >= BUFFER_SIZE - 1) {
+        uart_pos = 0;
+    }
+}
+
+void procesarMensajeLoRa() {
+    // Verificar si hay datos disponibles en LoRa
+    if (red.dataDisponible()) {
+        int len_recibido = red.getData(buffer_lora, MAX_PACKET_SIZE);
+        
+        if (len_recibido > 0) {
+            // Parsear como IPv4
+            IPv4Packet paquete;
+            if (parsearIPv4(buffer_lora, len_recibido, &paquete)) {
+                // Solo reenviar por UART si es para este nodo o broadcast
+                if (paquete.ip_destino == mi_ip || paquete.ip_destino == 0xFFFF) {
+                    enviarPorUART(&paquete);
+                }
+            }
+        }
+    }
+}
+
+bool decodificarSLIP(uint8_t* entrada, int len_entrada, uint8_t* salida, int* len_salida) {
+    int pos_salida = 0;
+    bool escape_next = false;
+    
+    for (int i = 0; i < len_entrada; i++) {
+        if (escape_next) {
+            if (entrada[i] == SLIP_ESC_END) {
+                salida[pos_salida++] = SLIP_END;
+            } else if (entrada[i] == SLIP_ESC_ESC) {
+                salida[pos_salida++] = SLIP_ESC;
             } else {
-                slipPacketComplete = true;
+                return false; // Error en decodificación
             }
-        } else if (slipPacketComplete) {
-            uartBuffer += c;
+            escape_next = false;
+        } else if (entrada[i] == SLIP_ESC) {
+            escape_next = true;
+        } else if (entrada[i] == SLIP_END) {
+            // Fin del frame (ignorar al final)
+            continue;
+        } else {
+            salida[pos_salida++] = entrada[i];
         }
-    }
-}
-
-void procesarLoRa() {
-    int packetSize = LoRa.parsePacket();
-    if (packetSize) {
-        ByteVector receivedData;
-        
-        while (LoRa.available()) {
-            receivedData.push_back(LoRa.read());
-        }
-        
-        IPv4 paquete;
-        if (parsearIPv4(receivedData, paquete)) {
-            manejarPaqueteDesdeLoRa(paquete);
-        }
-    }
-}
-
-void manejarPaqueteDesdeNodo(const IPv4 &paquete) {
-    // Verificar checksum
-    if (calcularChecksum(paquete) != paquete.checksum) {
-        Serial.println("Checksum incorrecto, descartando paquete");
-        return;
     }
     
-    // Verificar IP de origen
-    if (paquete.ip_origen != ip_modem) {
-        Serial.println("IP de origen no coincide, descartando paquete");
-        return;
-    }
-    
-    // Procesar según protocolo y destino
-    if (paquete.ip_destino == ip_modem && paquete.protocolo == 0) {
-        // Protocolo propio para comando interno
-        PropioProtocolo proto;
-        if (parsearProtocoloPropio(paquete.datos, proto)) {
-            ejecutarComandoPropio(proto);
-        }
-    } else if (paquete.ip_destino != ip_modem || paquete.ip_destino == 0xFFFF) {
-        // Enviar por LoRa (excepto protocolo propio para este nodo)
-        if (paquete.protocolo != 0) {
-            ByteVector ipv4Data = construirIPv4(paquete);
-            LoRa.beginPacket();
-            for (size_t i = 0; i < ipv4Data.size(); i++) {
-                LoRa.write(ipv4Data[i]);
-            }
-            LoRa.endPacket();
-            
-            // Mostrar en pantalla
-            mostrarEnPantalla("Enviado por LoRa", "Dest: 0x" + String(paquete.ip_destino, HEX));
-        }
-    }
+    *len_salida = pos_salida;
+    return true;
 }
 
-void manejarPaqueteDesdeLoRa(const IPv4 &paquete) {
-    // Verificar checksum
-    if (calcularChecksum(paquete) != paquete.checksum) {
-        Serial.println("Checksum incorrecto, descartando paquete LoRa");
-        return;
+bool codificarSLIP(uint8_t* entrada, int len_entrada, uint8_t* salida, int* len_salida) {
+    int pos_salida = 0;
+    
+    // Agregar SLIP_END al inicio
+    salida[pos_salida++] = SLIP_END;
+    
+    for (int i = 0; i < len_entrada; i++) {
+        if (entrada[i] == SLIP_END) {
+            salida[pos_salida++] = SLIP_ESC;
+            salida[pos_salida++] = SLIP_ESC_END;
+        } else if (entrada[i] == SLIP_ESC) {
+            salida[pos_salida++] = SLIP_ESC;
+            salida[pos_salida++] = SLIP_ESC_ESC;
+        } else {
+            salida[pos_salida++] = entrada[i];
+        }
     }
     
-    // Solo procesar si es para este nodo o broadcast
-    if (paquete.ip_destino == ip_modem || paquete.ip_destino == 0xFFFF) {
-        // Enviar por UART al Nodo
-        ByteVector ipv4Data = construirIPv4(paquete);
-        ByteVector slipData;
-        SLIP_encode(ipv4Data, slipData);
-        
-        Serial.write(SLIP_END);
-        for (size_t i = 0; i < slipData.size(); i++) {
-            Serial.write(slipData[i]);
-        }
-        Serial.write(SLIP_END);
-        
-        // Mostrar en pantalla según protocolo
-        switch (paquete.protocolo) {
-            case 1: // ACK
-                mostrarEnPantalla("ACK recibido", "De: 0x" + String(paquete.ip_origen, HEX));
-                break;
-            case 2: // Unicast
-                mostrarEnPantalla("Unicast recibido", "De: 0x" + String(paquete.ip_origen, HEX));
-                break;
-            case 3: // Broadcast
-                mostrarEnPantalla("Broadcast recibido", "De: 0x" + String(paquete.ip_origen, HEX));
-                break;
-            case 5: // Prueba
-                mostrarEnPantalla("Comando prueba", "Ejecutando...");
-                break;
-            case 6: // LED
-                mostrarEnPantalla("Comando LED", "Cambiando estado");
-                break;
-            case 7: // OLED
-                mostrarEnPantalla("Mensaje OLED", String((char*)paquete.datos.data()));
-                break;
-        }
-    }
+    // Agregar SLIP_END al final
+    salida[pos_salida++] = SLIP_END;
+    
+    *len_salida = pos_salida;
+    return true;
 }
 
-void ejecutarComandoPropio(const PropioProtocolo &proto) {
-    // Verificar FCS
-    if (calcularFCS(proto) != proto.fcs) {
-        Serial.println("FCS incorrecto, descartando comando");
-        return;
+bool parsearIPv4(uint8_t* datos, int len, IPv4Packet* paquete) {
+    if (len < 8) return false; // Mínimo para cabecera IPv4
+    
+    // Parsear campos de la cabecera
+    uint16_t campo1 = (datos[0] << 8) | datos[1];
+    paquete->flag_fragmento = (campo1 >> 14) & 0x3;
+    paquete->offset_fragmento = campo1 & 0x0FFF;
+    
+    paquete->longitud_total = datos[2];
+    paquete->relleno = datos[3];
+    paquete->identificador = (datos[4] << 8) | datos[5];
+    paquete->protocolo = datos[6];
+    paquete->checksum = datos[7];
+    paquete->ip_origen = (datos[8] << 8) | datos[9];
+    paquete->ip_destino = (datos[10] << 8) | datos[11];
+    
+    // Copiar datos
+    int datos_len = len - 12;
+    if (datos_len > 0) {
+        paquete->datos_len = (datos_len > MAX_PACKET_SIZE) ? MAX_PACKET_SIZE : datos_len;
+        memcpy(paquete->datos, &datos[12], paquete->datos_len);
+    } else {
+        paquete->datos_len = 0;
     }
     
-    // Ejecutar comando según protocolo propio
-    switch (proto.cmd) {
+    return true;
+}
+
+void construirIPv4(IPv4Packet* paquete, uint8_t* buffer, int* len) {
+    // Construir cabecera IPv4
+    uint16_t campo1 = (paquete->flag_fragmento << 14) | (paquete->offset_fragmento & 0x0FFF);
+    buffer[0] = (campo1 >> 8) & 0xFF;
+    buffer[1] = campo1 & 0xFF;
+    
+    buffer[2] = paquete->longitud_total;
+    buffer[3] = paquete->relleno;
+    buffer[4] = (paquete->identificador >> 8) & 0xFF;
+    buffer[5] = paquete->identificador & 0xFF;
+    buffer[6] = paquete->protocolo;
+    buffer[7] = paquete->checksum;
+    buffer[8] = (paquete->ip_origen >> 8) & 0xFF;
+    buffer[9] = paquete->ip_origen & 0xFF;
+    buffer[10] = (paquete->ip_destino >> 8) & 0xFF;
+    buffer[11] = paquete->ip_destino & 0xFF;
+    
+    // Copiar datos
+    memcpy(&buffer[12], paquete->datos, paquete->datos_len);
+    
+    *len = 12 + paquete->datos_len;
+}
+
+uint8_t calcularChecksum(IPv4Packet* paquete) {
+    // Checksum simple de la cabecera (sin IPs)
+    uint8_t checksum = 0;
+    uint16_t campo1 = (paquete->flag_fragmento << 14) | (paquete->offset_fragmento & 0x0FFF);
+    
+    checksum ^= (campo1 >> 8) & 0xFF;
+    checksum ^= campo1 & 0xFF;
+    checksum ^= paquete->longitud_total;
+    checksum ^= paquete->relleno;
+    checksum ^= (paquete->identificador >> 8) & 0xFF;
+    checksum ^= paquete->identificador & 0xFF;
+    checksum ^= paquete->protocolo;
+    
+    return checksum;
+}
+
+void procesarProtocoloPropio(PropioProtocolo* comando) {
+    switch (comando->cmd) {
         case 5: // Comando de prueba
             mostrarImagenPrueba();
             break;
+            
         case 6: // Cambiar estado LED
-            toggleLED();
+            led_state = !led_state;
+            digitalWrite(LED_PIN, led_state ? HIGH : LOW);
+            Serial.print("LED cambiado a: ");
+            Serial.println(led_state ? "ON" : "OFF");
             break;
-        case 7: // Mostrar en OLED
-            mostrarMensajeOLED(proto);
+            
+        case 7: // Mostrar mensaje en OLED
+            if (comando->longitud_de_dato > 0) {
+                String mensaje = "";
+                for (int i = 0; i < comando->longitud_de_dato; i++) {
+                    mensaje += (char)comando->dato[i];
+                }
+                mostrarEnOLED(mensaje);
+            }
             break;
+            
         default:
-            Serial.println("Comando propio desconocido");
+            Serial.print("Comando desconocido: ");
+            Serial.println(comando->cmd);
             break;
     }
+}
+
+void enviarPorUART(IPv4Packet* paquete) {
+    uint8_t buffer_ipv4[BUFFER_SIZE];
+    int len_ipv4;
+    
+    // Recalcular checksum
+    paquete->checksum = calcularChecksum(paquete);
+    
+    // Construir paquete IPv4
+    construirIPv4(paquete, buffer_ipv4, &len_ipv4);
+    
+    // Codificar en SLIP
+    uint8_t buffer_slip_tx[BUFFER_SIZE];
+    int len_slip;
+    
+    if (codificarSLIP(buffer_ipv4, len_ipv4, buffer_slip_tx, &len_slip)) {
+        // Enviar por UART
+        Serial.write(buffer_slip_tx, len_slip);
+    }
+}
+
+void enviarPorLoRa(IPv4Packet* paquete) {
+    uint8_t buffer_ipv4[MAX_PACKET_SIZE];
+    int len_ipv4;
+    
+    // Recalcular checksum
+    paquete->checksum = calcularChecksum(paquete);
+    
+    // Construir paquete IPv4
+    construirIPv4(paquete, buffer_ipv4, &len_ipv4);
+    
+    // Enviar por LoRa
+    red.transmite_data(buffer_ipv4, len_ipv4);
+}
+
+void mostrarEnOLED(String mensaje) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    
+    // Dividir mensaje en líneas
+    int inicio = 0;
+    int linea = 0;
+    int max_lineas = 8;
+    int max_chars_por_linea = 21;
+    
+    while (inicio < mensaje.length() && linea < max_lineas) {
+        String linea_texto = mensaje.substring(inicio, inicio + max_chars_por_linea);
+        display.println(linea_texto);
+        inicio += max_chars_por_linea;
+        linea++;
+    }
+    
+    display.display();
 }
 
 void mostrarImagenPrueba() {
-    Heltec.display->clear();
-    Heltec.display->drawXbm(0, 0, 128, 64, imagen_prueba_bits);
-    Heltec.display->display();
-}
-
-void toggleLED() {
-    static bool ledState = false;
-    ledState = !ledState;
-    digitalWrite(LED_BUILTIN, ledState);
-}
-
-void mostrarMensajeOLED(const PropioProtocolo &proto) {
-    Heltec.display->clear();
-    Heltec.display->setTextAlignment(TEXT_ALIGN_LEFT);
-    Heltec.display->setFont(ArialMT_Plain_10);
+    display.clearDisplay();
     
-    String mensaje;
-    for (int i = 0; i < proto.longitud_de_dato; i++) {
-        mensaje += (char)proto.dato[i];
+    // Crear un patrón de prueba simple
+    for (int i = 0; i < SCREEN_WIDTH; i += 8) {
+        for (int j = 0; j < SCREEN_HEIGHT; j += 8) {
+            display.drawRect(i, j, 8, 8, SSD1306_WHITE);
+        }
     }
     
-    Heltec.display->drawStringMaxWidth(0, 0, 128, mensaje);
-    Heltec.display->display();
+    // Agregar texto
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    display.setCursor(20, 28);
+    display.println("PRUEBA OK");
+    
+    display.display();
+    
+    Serial.println("Imagen de prueba mostrada en OLED");
 }
 
-void mostrarEnPantalla(String titulo, String mensaje) {
-    Heltec.display->clear();
-    Heltec.display->setTextAlignment(TEXT_ALIGN_LEFT);
-    Heltec.display->setFont(ArialMT_Plain_10);
-    Heltec.display->drawString(0, 0, titulo);
-    Heltec.display->drawString(0, 12, mensaje);
-    Heltec.display->display();
-}
-
-// Funciones de parseo y construcción (similares a las del Nodo)
-bool parsearIPv4(const ByteVector &entrada, IPv4 &salida) {
-    if (entrada.size() < 11) return false;
+uint8_t calcularFCS(PropioProtocolo* comando) {
+    uint8_t fcs = 0;
+    fcs ^= comando->cmd;
+    fcs ^= comando->longitud_de_dato;
     
-    salida.flag_fragmento = (entrada[0] >> 4) & 0x0F;
-    salida.offset_fragmento = ((entrada[0] & 0x0F) << 8) | entrada[1];
-    salida.longitud_total = entrada[2];
-    salida.identificador = (entrada[3] << 8) | entrada[4];
-    salida.protocolo = entrada[5];
-    salida.checksum = entrada[6];
-    salida.ip_origen = (entrada[7] << 8) | entrada[8];
-    salida.ip_destino = (entrada[9] << 8) | entrada[10];
-    
-    salida.datos.clear();
-    for (size_t i = 11; i < entrada.size(); ++i) {
-        salida.datos.push_back(entrada[i]);
-    }
-    
-    return true;
-}
-
-ByteVector construirIPv4(const IPv4 &entrada) {
-    ByteVector salida;
-    
-    BYTE byte0 = ((entrada.flag_fragmento & 0x0F) << 4) | ((entrada.offset_fragmento >> 8) & 0x0F);
-    BYTE byte1 = entrada.offset_fragmento & 0xFF;
-    
-    salida.push_back(byte0);
-    salida.push_back(byte1);
-    salida.push_back(entrada.longitud_total);
-    salida.push_back((entrada.identificador >> 8) & 0xFF);
-    salida.push_back(entrada.identificador & 0xFF);
-    salida.push_back(entrada.protocolo);
-    salida.push_back(entrada.checksum);
-    salida.push_back((entrada.ip_origen >> 8) & 0xFF);
-    salida.push_back(entrada.ip_origen & 0xFF);
-    salida.push_back((entrada.ip_destino >> 8) & 0xFF);
-    salida.push_back(entrada.ip_destino & 0xFF);
-    
-    for (size_t i = 0; i < entrada.datos.size(); ++i) {
-        salida.push_back(entrada.datos[i]);
-    }
-    
-    return salida;
-}
-
-BYTE calcularChecksum(const IPv4 &paquete) {
-    uint16_t suma = 0;
-    
-    suma += (paquete.flag_fragmento << 4) | (paquete.offset_fragmento >> 8);
-    suma += paquete.offset_fragmento & 0xFF;
-    suma += paquete.longitud_total;
-    suma += paquete.identificador >> 8;
-    suma += paquete.identificador & 0xFF;
-    suma += paquete.protocolo;
-    
-    suma = (suma & 0xFF) + (suma >> 8);
-    return (~suma) & 0xFF;
-}
-
-bool parsearProtocoloPropio(const ByteVector &entrada, PropioProtocolo &protocolo) {
-    if (entrada.size() < 3) return false;
-    
-    protocolo.cmd = (entrada[0] >> 4) & 0x0F;
-    protocolo.longitud_de_dato = entrada[1] & 0x3F;
-    
-    if (entrada.size() < (2 + protocolo.longitud_de_dato + 1)) return false;
-    
-    memset(protocolo.dato, 0, sizeof(protocolo.dato));
-    for (int i = 0; i < protocolo.longitud_de_dato && i < 63; ++i) {
-        protocolo.dato[i] = entrada[2 + i];
-    }
-    
-    protocolo.fcs = entrada[2 + protocolo.longitud_de_dato];
-    return true;
-}
-
-BYTE calcularFCS(const PropioProtocolo &protocolo) {
-    BYTE fcs = 0;
-    fcs ^= (protocolo.cmd << 4);
-    fcs ^= protocolo.longitud_de_dato;
-    
-    for (int i = 0; i < protocolo.longitud_de_dato && i < 63; ++i) {
-        fcs ^= protocolo.dato[i];
+    for (int i = 0; i < comando->longitud_de_dato; i++) {
+        fcs ^= comando->dato[i];
     }
     
     return fcs;
-}
-
-bool SLIP_encode(const ByteVector &entrada, ByteVector &salida) {
-    salida.clear();
-    salida.push_back(SLIP_END);
-    
-    for (size_t i = 0; i < entrada.size(); ++i) {
-        BYTE b = entrada[i];
-        if (b == SLIP_END) {
-            salida.push_back(SLIP_ESC);
-            salida.push_back(SLIP_ESC_END);
-        } else if (b == SLIP_ESC) {
-            salida.push_back(SLIP_ESC);
-            salida.push_back(SLIP_ESC_ESC);
-        } else {
-            salida.push_back(b);
-        }
-    }
-    
-    salida.push_back(SLIP_END);
-    return true;
-}
-
-bool SLIP_decode(const ByteVector &entrada, ByteVector &salida) {
-    salida.clear();
-    bool dentro = false;
-    
-    for (size_t i = 0; i < entrada.size(); ++i) {
-        BYTE b = entrada[i];
-        
-        if (b == SLIP_END) {
-            if (dentro && !salida.empty()) return true;
-            dentro = true;
-            continue;
-        }
-        
-        if (!dentro) continue;
-        
-        if (b == SLIP_ESC) {
-            if (i + 1 >= entrada.size()) return false;
-            BYTE siguiente = entrada[++i];
-            if (siguiente == SLIP_ESC_END) {
-                salida.push_back(SLIP_END);
-            } else if (siguiente == SLIP_ESC_ESC) {
-                salida.push_back(SLIP_ESC);
-            } else {
-                return false;
-            }
-        } else {
-            salida.push_back(b);
-        }
-    }
-    
-    return !salida.empty();
 }
 
